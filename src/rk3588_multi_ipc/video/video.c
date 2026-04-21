@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "video.h"
+#include "draw_paint.h"
 #include "rk_algo_avs_tool_api.h"
 
 #ifdef LOG_TAG
@@ -3423,20 +3424,10 @@ int rk_video_set_display_camera(int camera_index) {
 /*
  * Draw-rectangle thread: uses an OVERLAY_RGN attached to VENC channel 1
  * (/live/1) to render a green 100x100 rectangle centered on the frame.
- * The bitmap is filled by CPU (ARGB8888) and updated periodically so the
- * overlay stays alive even if the RGN layer is reset by other operations.
+ * The bitmap is filled by CPU using draw_border() from draw_paint and
+ * updated periodically so the overlay stays alive even if the RGN layer
+ * is reset by other operations.
  */
-static void draw_rect_fill_border(RK_U32 *buf, int w, int h, int border, RK_U32 color) {
-	for (int y = 0; y < h; y++) {
-		for (int x = 0; x < w; x++) {
-			if (y < border || y >= h - border || x < border || x >= w - border)
-				buf[y * w + x] = color;
-			else
-				buf[y * w + x] = 0x00000000; /* transparent interior */
-		}
-	}
-}
-
 static void *rkipc_draw_rect_thread(void *arg) {
 	(void)arg;
 	LOG_INFO("#Start %s thread\n", __func__);
@@ -3449,13 +3440,25 @@ static void *rkipc_draw_rect_thread(void *arg) {
 
 	/* Allocate ARGB8888 bitmap for the rectangle */
 	int buf_size = DRAW_RECT_WIDTH * DRAW_RECT_HEIGHT * 4; /* 4 bytes per pixel */
-	RK_U32 *bmp_buf = (RK_U32 *)malloc(buf_size);
+	uint32_t *bmp_buf = (uint32_t *)malloc(buf_size);
 	if (!bmp_buf) {
 		LOG_ERROR("draw_rect: malloc %d bytes failed\n", buf_size);
 		return NULL;
 	}
-	draw_rect_fill_border(bmp_buf, DRAW_RECT_WIDTH, DRAW_RECT_HEIGHT,
-	                      DRAW_RECT_BORDER, DRAW_RECT_COLOR_ARGB);
+	memset(bmp_buf, 0, buf_size); /* transparent background */
+
+	/* Use draw_border from draw_paint to render the green rectangle border */
+	BorderInfo border_info;
+	memset(&border_info, 0, sizeof(border_info));
+	border_info.rect.x = 0;
+	border_info.rect.y = 0;
+	border_info.rect.w = DRAW_RECT_WIDTH;
+	border_info.rect.h = DRAW_RECT_HEIGHT;
+	border_info.color = DRAW_RECT_COLOR_ARGB;
+	border_info.color_key = 0x00000000; /* transparent */
+	border_info.thick = DRAW_RECT_BORDER;
+	border_info.display_style = BORDER_LINE;
+	draw_border(bmp_buf, border_info);
 
 	/* Create the OVERLAY region */
 	RGN_ATTR_S stRgnAttr;
