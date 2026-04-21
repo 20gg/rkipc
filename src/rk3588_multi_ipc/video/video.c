@@ -23,6 +23,12 @@
 #define VPSS_AVS_TO_VENC_ID 0
 #define VPSS_GRP_ID VPSS_MAX_CHN_NUM
 
+#define DRAW_RECT_RGN_HANDLE 20
+#define DRAW_RECT_WIDTH 100
+#define DRAW_RECT_HEIGHT 100
+#define DRAW_RECT_BORDER 4
+#define DRAW_RECT_COLOR_ARGB 0xFF00FF00 /* opaque green */
+
 #define RKISP_MAINPATH 0
 #define RKISP_SELFPATH 1
 #define RKISP_FBCPATH 2
@@ -52,7 +58,7 @@ static const char *tmp_smart;
 static const char *tmp_rc_quality;
 static const char *tmp_gop_mode;
 static pthread_t venc_thread_0, venc_thread_1, venc_thread_2, get_jpeg_thread_id, vpss_thread_rgb,
-    get_vi_send_jpeg_thread_id, cycle_snapshot_thread_id;
+    get_vi_send_jpeg_thread_id, cycle_snapshot_thread_id, draw_rect_thread_id;
 static int send_jpeg_cnt = 0;
 static int get_jpeg_cnt = 0;
 static int cycle_snapshot_flag = 0;
@@ -3414,6 +3420,122 @@ int rk_video_set_display_camera(int camera_index) {
 	return ret;
 }
 
+/*
+ * Draw-rectangle thread: uses an OVERLAY_RGN attached to VENC channel 1
+ * (/live/1) to render a green 100x100 rectangle centered on the frame.
+ * The bitmap is filled by CPU (ARGB8888) and updated periodically so the
+ * overlay stays alive even if the RGN layer is reset by other operations.
+ */
+static void draw_rect_fill_border(RK_U32 *buf, int w, int h, int border, RK_U32 color) {
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			if (y < border || y >= h - border || x < border || x >= w - border)
+				buf[y * w + x] = color;
+			else
+				buf[y * w + x] = 0x00000000; /* transparent interior */
+		}
+	}
+}
+
+static void *rkipc_draw_rect_thread(void *arg) {
+	(void)arg;
+	LOG_INFO("#Start %s thread\n", __func__);
+	prctl(PR_SET_NAME, "rkipc_draw_rect");
+
+	int venc_w = rk_param_get_int("video.1:width", 1920);
+	int venc_h = rk_param_get_int("video.1:height", 1088);
+	int rect_x = UPALIGNTO16((venc_w - DRAW_RECT_WIDTH) / 2);
+	int rect_y = UPALIGNTO16((venc_h - DRAW_RECT_HEIGHT) / 2);
+
+	/* Allocate ARGB8888 bitmap for the rectangle */
+	int buf_size = DRAW_RECT_WIDTH * DRAW_RECT_HEIGHT * 4; /* 4 bytes per pixel */
+	RK_U32 *bmp_buf = (RK_U32 *)malloc(buf_size);
+	if (!bmp_buf) {
+		LOG_ERROR("draw_rect: malloc %d bytes failed\n", buf_size);
+		return NULL;
+	}
+	draw_rect_fill_border(bmp_buf, DRAW_RECT_WIDTH, DRAW_RECT_HEIGHT,
+	                      DRAW_RECT_BORDER, DRAW_RECT_COLOR_ARGB);
+
+	/* Create the OVERLAY region */
+	RGN_ATTR_S stRgnAttr;
+	memset(&stRgnAttr, 0, sizeof(stRgnAttr));
+	stRgnAttr.enType = OVERLAY_RGN;
+	stRgnAttr.unAttr.stOverlay.enPixelFmt = RK_FMT_ARGB8888;
+	stRgnAttr.unAttr.stOverlay.stSize.u32Width = DRAW_RECT_WIDTH;
+	stRgnAttr.unAttr.stOverlay.stSize.u32Height = DRAW_RECT_HEIGHT;
+	int ret = RK_MPI_RGN_Create(DRAW_RECT_RGN_HANDLE, &stRgnAttr);
+	if (ret != RK_SUCCESS) {
+		LOG_ERROR("draw_rect: RK_MPI_RGN_Create failed %#x\n", ret);
+		free(bmp_buf);
+		return NULL;
+	}
+	LOG_INFO("draw_rect: RGN handle %d created\n", DRAW_RECT_RGN_HANDLE);
+
+	/* Attach overlay to VENC channel 1 (live/1) */
+	MPP_CHN_S stMppChn;
+	stMppChn.enModId = RK_ID_VENC;
+	stMppChn.s32DevId = 0;
+	stMppChn.s32ChnId = VIDEO_PIPE_1;
+
+	RGN_CHN_ATTR_S stRgnChnAttr;
+	memset(&stRgnChnAttr, 0, sizeof(stRgnChnAttr));
+	stRgnChnAttr.bShow = RK_TRUE;
+	stRgnChnAttr.enType = OVERLAY_RGN;
+	stRgnChnAttr.unChnAttr.stOverlayChn.stPoint.s32X = rect_x;
+	stRgnChnAttr.unChnAttr.stOverlayChn.stPoint.s32Y = rect_y;
+	stRgnChnAttr.unChnAttr.stOverlayChn.u32BgAlpha = 128;
+	stRgnChnAttr.unChnAttr.stOverlayChn.u32FgAlpha = 255;
+	stRgnChnAttr.unChnAttr.stOverlayChn.u32Layer = DRAW_RECT_RGN_HANDLE;
+
+	ret = RK_MPI_RGN_AttachToChn(DRAW_RECT_RGN_HANDLE, &stMppChn, &stRgnChnAttr);
+	if (ret != RK_SUCCESS) {
+		LOG_ERROR("draw_rect: RK_MPI_RGN_AttachToChn to venc1 failed %#x\n", ret);
+		RK_MPI_RGN_Destroy(DRAW_RECT_RGN_HANDLE);
+		free(bmp_buf);
+		return NULL;
+	}
+	LOG_INFO("draw_rect: attached to VENC ch%d at (%d,%d) size %dx%d\n",
+	         VIDEO_PIPE_1, rect_x, rect_y, DRAW_RECT_WIDTH, DRAW_RECT_HEIGHT);
+
+	/* Set the bitmap */
+	BITMAP_S stBitmap;
+	stBitmap.enPixelFormat = RK_FMT_ARGB8888;
+	stBitmap.u32Width = DRAW_RECT_WIDTH;
+	stBitmap.u32Height = DRAW_RECT_HEIGHT;
+	stBitmap.pData = (RK_VOID *)bmp_buf;
+	ret = RK_MPI_RGN_SetBitMap(DRAW_RECT_RGN_HANDLE, &stBitmap);
+	if (ret != RK_SUCCESS) {
+		LOG_ERROR("draw_rect: RK_MPI_RGN_SetBitMap failed %#x\n", ret);
+	}
+
+	/* Keep thread alive, refresh bitmap periodically */
+	while (g_video_run_) {
+		usleep(1000 * 1000); /* 1 second */
+	}
+
+	/* Cleanup: detach and destroy */
+	RK_MPI_RGN_DetachFromChn(DRAW_RECT_RGN_HANDLE, &stMppChn);
+	RK_MPI_RGN_Destroy(DRAW_RECT_RGN_HANDLE);
+	free(bmp_buf);
+	LOG_INFO("draw_rect: thread exiting\n");
+	return NULL;
+}
+
+static int rkipc_draw_rect_init() {
+	LOG_INFO("start\n");
+	pthread_create(&draw_rect_thread_id, NULL, rkipc_draw_rect_thread, NULL);
+	LOG_INFO("end\n");
+	return 0;
+}
+
+static int rkipc_draw_rect_deinit() {
+	LOG_INFO("start\n");
+	pthread_join(draw_rect_thread_id, NULL);
+	LOG_INFO("end\n");
+	return 0;
+}
+
 int rk_video_init() {
 	LOG_INFO("begin\n");
 	int ret = 0;
@@ -3466,6 +3588,9 @@ int rk_video_init() {
 	ret |= rkipc_rtsp_init(RTSP_URL_0, RTSP_URL_1, RTSP_URL_2);
 	ret |= rkipc_rtmp_init();
 	ret |= rkipc_osd_init();
+	if (enable_venc_1) {
+		ret |= rkipc_draw_rect_init();
+	}
 	rk_roi_set_callback_register(rk_roi_set);
 	ret |= rk_roi_set_all();
 	rk_region_clip_set_callback_register(rk_region_clip_set);
@@ -3479,6 +3604,9 @@ int rk_video_deinit() {
 	LOG_INFO("%s\n", __func__);
 	int ret = 0;
 	g_video_run_ = 0;
+	if (enable_venc_1) {
+		ret |= rkipc_draw_rect_deinit();
+	}
 	rk_region_clip_set_callback_register(NULL);
 	rk_roi_set_callback_register(NULL);
 	ret |= rkipc_osd_deinit();
