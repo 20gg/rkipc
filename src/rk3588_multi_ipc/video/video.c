@@ -24,8 +24,9 @@
 #define VPSS_AVS_TO_VENC_ID 0
 #define VPSS_GRP_ID VPSS_MAX_CHN_NUM
 
-#define DRAW_RECT_RGN_HANDLE 20
-#define DRAW_RECT_OVERLAY_LAYER 7
+#define DRAW_RECT_COUNT 3
+#define DRAW_RECT_RGN_HANDLE_BASE 20 /* handles 20, 21, 22 */
+#define DRAW_RECT_LAYER_BASE 5       /* layers 5, 6, 7 */
 #define DRAW_RECT_WIDTH 112  /* UPALIGNTO16(100), must be 16-aligned for RGN */
 #define DRAW_RECT_HEIGHT 112 /* UPALIGNTO16(100), must be 16-aligned for RGN */
 #define DRAW_RECT_BORDER 4
@@ -3429,6 +3430,7 @@ int rk_video_set_display_camera(int camera_index) {
  * A background thread periodically refreshes the bitmap to keep it visible.
  */
 static uint32_t *g_draw_rect_buf = NULL;
+static int g_draw_rect_created[DRAW_RECT_COUNT] = {0};
 
 static void *rkipc_draw_rect_thread(void *arg) {
 	(void)arg;
@@ -3441,11 +3443,15 @@ static void *rkipc_draw_rect_thread(void *arg) {
 	stBitmap.u32Height = DRAW_RECT_HEIGHT;
 	stBitmap.pData = (RK_VOID *)g_draw_rect_buf;
 
-	/* Periodically refresh the bitmap to keep overlay visible */
+	/* Periodically refresh all bitmaps to keep overlays visible */
 	while (g_video_run_) {
-		int ret = RK_MPI_RGN_SetBitMap(DRAW_RECT_RGN_HANDLE, &stBitmap);
-		if (ret != RK_SUCCESS) {
-			LOG_ERROR("draw_rect: RK_MPI_RGN_SetBitMap refresh failed %#x\n", ret);
+		for (int i = 0; i < DRAW_RECT_COUNT; i++) {
+			if (!g_draw_rect_created[i])
+				continue;
+			int ret = RK_MPI_RGN_SetBitMap(DRAW_RECT_RGN_HANDLE_BASE + i, &stBitmap);
+			if (ret != RK_SUCCESS) {
+				LOG_ERROR("draw_rect[%d]: RK_MPI_RGN_SetBitMap refresh failed %#x\n", i, ret);
+			}
 		}
 		usleep(500 * 1000); /* refresh every 500ms */
 	}
@@ -3459,10 +3465,23 @@ static int rkipc_draw_rect_init() {
 	int ret;
 	int venc_w = rk_param_get_int("video.1:width", 1920);
 	int venc_h = rk_param_get_int("video.1:height", 1088);
-	int rect_x = UPALIGNTO16((venc_w - DRAW_RECT_WIDTH) / 2);
-	int rect_y = UPALIGNTO16((venc_h - DRAW_RECT_HEIGHT) / 2);
 
-	/* Allocate ARGB8888 bitmap for the rectangle */
+	/*
+	 * 3 rectangles layout (all 112x112, 16-aligned positions):
+	 *   rect[0]: left area
+	 *   rect[1]: center
+	 *   rect[2]: right area
+	 */
+	int rect_positions[DRAW_RECT_COUNT][2] = {
+	    {UPALIGNTO16(venc_w / 4 - DRAW_RECT_WIDTH / 2),
+	     UPALIGNTO16((venc_h - DRAW_RECT_HEIGHT) / 2)},
+	    {UPALIGNTO16((venc_w - DRAW_RECT_WIDTH) / 2),
+	     UPALIGNTO16((venc_h - DRAW_RECT_HEIGHT) / 2)},
+	    {UPALIGNTO16(venc_w * 3 / 4 - DRAW_RECT_WIDTH / 2),
+	     UPALIGNTO16((venc_h - DRAW_RECT_HEIGHT) / 2)},
+	};
+
+	/* Allocate a shared ARGB8888 bitmap for the rectangle (same shape for all 3) */
 	int buf_size = DRAW_RECT_WIDTH * DRAW_RECT_HEIGHT * 4;
 	g_draw_rect_buf = (uint32_t *)malloc(buf_size);
 	if (!g_draw_rect_buf) {
@@ -3484,60 +3503,61 @@ static int rkipc_draw_rect_init() {
 	border_info.display_style = BORDER_LINE;
 	draw_border(g_draw_rect_buf, border_info);
 
-	/* Create the OVERLAY region */
-	RGN_ATTR_S stRgnAttr;
-	memset(&stRgnAttr, 0, sizeof(stRgnAttr));
-	stRgnAttr.enType = OVERLAY_RGN;
-	stRgnAttr.unAttr.stOverlay.enPixelFmt = RK_FMT_ARGB8888;
-	stRgnAttr.unAttr.stOverlay.stSize.u32Width = DRAW_RECT_WIDTH;
-	stRgnAttr.unAttr.stOverlay.stSize.u32Height = DRAW_RECT_HEIGHT;
-	ret = RK_MPI_RGN_Create(DRAW_RECT_RGN_HANDLE, &stRgnAttr);
-	if (ret != RK_SUCCESS) {
-		LOG_ERROR("draw_rect: RK_MPI_RGN_Create(%d) failed %#x\n", DRAW_RECT_RGN_HANDLE, ret);
-		free(g_draw_rect_buf);
-		g_draw_rect_buf = NULL;
-		return -1;
-	}
-	LOG_INFO("draw_rect: RGN handle %d created OK\n", DRAW_RECT_RGN_HANDLE);
+	/* Create 3 OVERLAY regions and attach to VENC channel 1 */
+	for (int i = 0; i < DRAW_RECT_COUNT; i++) {
+		int rgn_handle = DRAW_RECT_RGN_HANDLE_BASE + i;
+		int layer = DRAW_RECT_LAYER_BASE + i;
+		int pos_x = rect_positions[i][0];
+		int pos_y = rect_positions[i][1];
 
-	/* Attach overlay to VENC channel 1 (live/1) */
-	MPP_CHN_S stMppChn;
-	stMppChn.enModId = RK_ID_VENC;
-	stMppChn.s32DevId = 0;
-	stMppChn.s32ChnId = VIDEO_PIPE_1;
+		RGN_ATTR_S stRgnAttr;
+		memset(&stRgnAttr, 0, sizeof(stRgnAttr));
+		stRgnAttr.enType = OVERLAY_RGN;
+		stRgnAttr.unAttr.stOverlay.enPixelFmt = RK_FMT_ARGB8888;
+		stRgnAttr.unAttr.stOverlay.stSize.u32Width = DRAW_RECT_WIDTH;
+		stRgnAttr.unAttr.stOverlay.stSize.u32Height = DRAW_RECT_HEIGHT;
+		ret = RK_MPI_RGN_Create(rgn_handle, &stRgnAttr);
+		if (ret != RK_SUCCESS) {
+			LOG_ERROR("draw_rect[%d]: RK_MPI_RGN_Create(%d) failed %#x\n", i, rgn_handle, ret);
+			continue;
+		}
 
-	RGN_CHN_ATTR_S stRgnChnAttr;
-	memset(&stRgnChnAttr, 0, sizeof(stRgnChnAttr));
-	stRgnChnAttr.bShow = RK_TRUE;
-	stRgnChnAttr.enType = OVERLAY_RGN;
-	stRgnChnAttr.unChnAttr.stOverlayChn.stPoint.s32X = rect_x;
-	stRgnChnAttr.unChnAttr.stOverlayChn.stPoint.s32Y = rect_y;
-	stRgnChnAttr.unChnAttr.stOverlayChn.u32BgAlpha = 128;
-	stRgnChnAttr.unChnAttr.stOverlayChn.u32FgAlpha = 128;
-	stRgnChnAttr.unChnAttr.stOverlayChn.u32Layer = DRAW_RECT_OVERLAY_LAYER;
+		MPP_CHN_S stMppChn;
+		stMppChn.enModId = RK_ID_VENC;
+		stMppChn.s32DevId = 0;
+		stMppChn.s32ChnId = VIDEO_PIPE_1;
 
-	ret = RK_MPI_RGN_AttachToChn(DRAW_RECT_RGN_HANDLE, &stMppChn, &stRgnChnAttr);
-	if (ret != RK_SUCCESS) {
-		LOG_ERROR("draw_rect: RK_MPI_RGN_AttachToChn to venc%d failed %#x\n", VIDEO_PIPE_1, ret);
-		RK_MPI_RGN_Destroy(DRAW_RECT_RGN_HANDLE);
-		free(g_draw_rect_buf);
-		g_draw_rect_buf = NULL;
-		return -1;
-	}
-	LOG_INFO("draw_rect: attached to VENC ch%d at (%d,%d) size %dx%d\n",
-	         VIDEO_PIPE_1, rect_x, rect_y, DRAW_RECT_WIDTH, DRAW_RECT_HEIGHT);
+		RGN_CHN_ATTR_S stRgnChnAttr;
+		memset(&stRgnChnAttr, 0, sizeof(stRgnChnAttr));
+		stRgnChnAttr.bShow = RK_TRUE;
+		stRgnChnAttr.enType = OVERLAY_RGN;
+		stRgnChnAttr.unChnAttr.stOverlayChn.stPoint.s32X = pos_x;
+		stRgnChnAttr.unChnAttr.stOverlayChn.stPoint.s32Y = pos_y;
+		stRgnChnAttr.unChnAttr.stOverlayChn.u32BgAlpha = 128;
+		stRgnChnAttr.unChnAttr.stOverlayChn.u32FgAlpha = 128;
+		stRgnChnAttr.unChnAttr.stOverlayChn.u32Layer = layer;
 
-	/* Set the initial bitmap */
-	BITMAP_S stBitmap;
-	stBitmap.enPixelFormat = RK_FMT_ARGB8888;
-	stBitmap.u32Width = DRAW_RECT_WIDTH;
-	stBitmap.u32Height = DRAW_RECT_HEIGHT;
-	stBitmap.pData = (RK_VOID *)g_draw_rect_buf;
-	ret = RK_MPI_RGN_SetBitMap(DRAW_RECT_RGN_HANDLE, &stBitmap);
-	if (ret != RK_SUCCESS) {
-		LOG_ERROR("draw_rect: RK_MPI_RGN_SetBitMap failed %#x\n", ret);
-	} else {
-		LOG_INFO("draw_rect: bitmap set OK\n");
+		ret = RK_MPI_RGN_AttachToChn(rgn_handle, &stMppChn, &stRgnChnAttr);
+		if (ret != RK_SUCCESS) {
+			LOG_ERROR("draw_rect[%d]: RK_MPI_RGN_AttachToChn(layer=%d) to venc%d failed %#x\n",
+			          i, layer, VIDEO_PIPE_1, ret);
+			RK_MPI_RGN_Destroy(rgn_handle);
+			continue;
+		}
+
+		BITMAP_S stBitmap;
+		stBitmap.enPixelFormat = RK_FMT_ARGB8888;
+		stBitmap.u32Width = DRAW_RECT_WIDTH;
+		stBitmap.u32Height = DRAW_RECT_HEIGHT;
+		stBitmap.pData = (RK_VOID *)g_draw_rect_buf;
+		ret = RK_MPI_RGN_SetBitMap(rgn_handle, &stBitmap);
+		if (ret != RK_SUCCESS) {
+			LOG_ERROR("draw_rect[%d]: RK_MPI_RGN_SetBitMap failed %#x\n", i, ret);
+		}
+
+		g_draw_rect_created[i] = 1;
+		LOG_INFO("draw_rect[%d]: handle=%d layer=%d pos=(%d,%d) size=%dx%d OK\n",
+		         i, rgn_handle, layer, pos_x, pos_y, DRAW_RECT_WIDTH, DRAW_RECT_HEIGHT);
 	}
 
 	/* Start refresh thread */
@@ -3554,8 +3574,15 @@ static int rkipc_draw_rect_deinit() {
 	stMppChn.enModId = RK_ID_VENC;
 	stMppChn.s32DevId = 0;
 	stMppChn.s32ChnId = VIDEO_PIPE_1;
-	RK_MPI_RGN_DetachFromChn(DRAW_RECT_RGN_HANDLE, &stMppChn);
-	RK_MPI_RGN_Destroy(DRAW_RECT_RGN_HANDLE);
+
+	for (int i = 0; i < DRAW_RECT_COUNT; i++) {
+		if (!g_draw_rect_created[i])
+			continue;
+		int rgn_handle = DRAW_RECT_RGN_HANDLE_BASE + i;
+		RK_MPI_RGN_DetachFromChn(rgn_handle, &stMppChn);
+		RK_MPI_RGN_Destroy(rgn_handle);
+		g_draw_rect_created[i] = 0;
+	}
 
 	if (g_draw_rect_buf) {
 		free(g_draw_rect_buf);
