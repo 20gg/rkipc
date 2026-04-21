@@ -25,8 +25,9 @@
 #define VPSS_GRP_ID VPSS_MAX_CHN_NUM
 
 #define DRAW_RECT_RGN_HANDLE 20
-#define DRAW_RECT_WIDTH 100
-#define DRAW_RECT_HEIGHT 100
+#define DRAW_RECT_OVERLAY_LAYER 7
+#define DRAW_RECT_WIDTH 112  /* UPALIGNTO16(100), must be 16-aligned for RGN */
+#define DRAW_RECT_HEIGHT 112 /* UPALIGNTO16(100), must be 16-aligned for RGN */
 #define DRAW_RECT_BORDER 4
 #define DRAW_RECT_COLOR_ARGB 0xFF00FF00 /* opaque green */
 
@@ -3489,7 +3490,7 @@ static void *rkipc_draw_rect_thread(void *arg) {
 	stRgnChnAttr.unChnAttr.stOverlayChn.stPoint.s32Y = rect_y;
 	stRgnChnAttr.unChnAttr.stOverlayChn.u32BgAlpha = 128;
 	stRgnChnAttr.unChnAttr.stOverlayChn.u32FgAlpha = 255;
-	stRgnChnAttr.unChnAttr.stOverlayChn.u32Layer = DRAW_RECT_RGN_HANDLE;
+	stRgnChnAttr.unChnAttr.stOverlayChn.u32Layer = DRAW_RECT_OVERLAY_LAYER;
 
 	ret = RK_MPI_RGN_AttachToChn(DRAW_RECT_RGN_HANDLE, &stMppChn, &stRgnChnAttr);
 	if (ret != RK_SUCCESS) {
